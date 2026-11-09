@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="vi">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flock</title>
+<style>
+  :root {
+    --bg: #0b0f17; --panel: rgba(16, 22, 34, 0.86); --line: #243049; --text: #c9d4e8; --muted: #6b7a96;
+    --accent: #6fb6ff; --danger: #ff5a5a; --wall: #1a2232; --wall-edge: #33425f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; color: var(--text); font: 13px/1.4 system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+  #hud { position: fixed; left: 12px; top: 10px; color: var(--muted); font: 12px ui-monospace, Consolas, monospace; pointer-events: none; white-space: pre; }
+  #toggle { position: fixed; right: 12px; top: 10px; z-index: 2; }
+  #panel {
+    position: fixed; right: 12px; top: 48px; width: 290px; max-height: calc(100vh - 60px); overflow: auto;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    backdrop-filter: blur(6px);
+  }
+  #panel.hidden { display: none; }
+  h3 { margin: 12px 0 6px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  h3:first-child { margin-top: 2px; }
+  label.r { display: grid; grid-template-columns: 1fr 52px; gap: 0 6px; margin: 4px 0; }
+  label.r input { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
+  label.r output { text-align: right; color: var(--muted); font: 11px ui-monospace, Consolas, monospace; }
+  label.c { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+  select { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px; }
+  .row { display: flex; flex-wrap: wrap; gap: 4px; }
+  button {
+    background: #141c2b; color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 8px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.on { background: var(--accent); color: #06101e; border-color: var(--accent); }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  kbd { font: 11px ui-monospace, Consolas, monospace; background: #141c2b; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+  .keys { color: var(--muted); font-size: 12px; line-height: 1.9; }
+  @media (max-width: 600px) { #panel { left: 16px; right: 16px; width: auto; max-height: 55vh; top: auto; bottom: 16px; } }
+</style>
+
+<canvas id="c" aria-label="Mô phỏng đàn chim"></canvas>
+<div id="hud"></div>
+<button id="toggle" title="Bảng điều khiển (H)">☰ Điều khiển</button>
+<div id="panel"></div>
+
+<script src="sim.js"></script>
+<script>
+const { S } = Sim, P = S.P;
+const c = document.getElementById('c'), g = c.getContext('2d', { alpha: false });
+const panel = document.getElementById('panel'), hud = document.getElementById('hud');
+const BG = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
+const STORE = 'flock.params';
+
+// ---------- persistence ----------
+try {
+  const saved = JSON.parse(localStorage.getItem(STORE) || '{}');
+  for (const k in S.DEFAULTS) if (typeof saved[k] === typeof S.DEFAULTS[k]) P[k] = saved[k];
+} catch {}
+const save = () => { try { localStorage.setItem(STORE, JSON.stringify(P)); } catch {} };
+
+// ---------- canvas sizing (crisp on HiDPI) ----------
+let dpr = 1;
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  c.width = innerWidth * dpr; c.height = innerHeight * dpr;
+  Sim.resize(innerWidth, innerHeight);
+  g.fillStyle = BG; g.fillRect(0, 0, c.width, c.height);
+}
+addEventListener('resize', resize); resize();
+Sim.sync();
+
+// ---------- panel ----------
+const GROUPS = [
+  ['Đàn', [
+    ['count', 'Số chim', 0, S.CAP, 10], ['species', 'Số loài', 1, 4, 1], ['predators', 'Diều hâu tự do', 0, 10, 1],
+  ]],
+  ['Hành vi', [
+    ['view', 'Tầm nhìn', 10, 150, 1], ['maxNeighbours', 'Số hàng xóm theo dõi', 4, 200, 1],
+    ['crowd', 'Khoảng cách tách', 4, 60, 1], ['cohesion', 'Gắn kết', 0, 0.03, 0.0005],
+    ['alignment', 'Đồng hướng', 0, 0.2, 0.005], ['separation', 'Tách nhau', 0, 0.8, 0.01],
+    ['maxSpeed', 'Tốc độ tối đa', 0.5, 10, 0.1], ['minSpeed', 'Tốc độ tối thiểu', 0, 5, 0.1],
+  ]],
+  ['Săn mồi', [
+    ['fear', 'Bán kính sợ', 20, 300, 5], ['flee', 'Lực bỏ chạy', 0, 2, 0.05], ['hunt', 'Tầm săn', 30, 400, 5],
+  ]],
+  ['Hiển thị', [
+    ['size', 'Kích thước', 0.5, 3, 0.1], ['trails', 'Độ dài vệt', 0, 0.95, 0.01],
+    ['wallSize', 'Cỡ vật cản', 8, 60, 1], ['timeScale', 'Tốc độ mô phỏng', 0.1, 3, 0.1],
+  ]],
+];
+const TOOLS = [['hawk', 'Diều hâu'], ['lure', 'Mồi nhử'], ['add', 'Thả chim'], ['wall', 'Vẽ vật cản'], ['erase', 'Xoá vật cản']];
+const COLOR_MODES = ['Theo loài', 'Theo hướng bay', 'Theo mật độ'];
+
+const fmt = v => (Number.isInteger(v) ? v : +v.toFixed(4)).toString();
+let html = '<h3>Công cụ chuột</h3><div class="row" id="tools">' +
+  TOOLS.map(([k, l], i) => `<button data-tool="${k}" title="Phím ${i + 1}">${l}</button>`).join('') + '</div>';
+for (const [title, items] of GROUPS) {
+  html += `<h3>${title}</h3>`;
+  for (const [k, l, min, max, st] of items)
+    html += `<label class="r"><span>${l}</span><output id="o-${k}"></output><input type="range" id="i-${k}" min="${min}" max="${max}" step="${st}"></label>`;
+}
+html += `<label class="c"><input type="checkbox" id="i-wrap"> Biên cuộn vòng</label>
+  <label class="c"><input type="checkbox" id="i-respawn"> Tự sinh lại chim bị ăn</label>
+  <label class="r"><span>Tô màu</span><output></output><select id="i-colorMode">${COLOR_MODES.map((m, i) => `<option value="${i}">${m}</option>`).join('')}</select></label>
+  <h3>Hành động</h3><div class="row">
+    <button id="b-pause">Tạm dừng</button><button id="b-step">Bước</button><button id="b-reset">Làm lại</button>
+    <button id="b-walls">Xoá vật cản</button><button id="b-defaults">Mặc định</button>
+    <button id="b-shot">Chụp ảnh</button><button id="b-full">Toàn màn hình</button>
+  </div>
+  <h3>Phím tắt</h3><div class="keys">
+    <kbd>1</kbd>–<kbd>5</kbd> công cụ · <kbd>Space</kbd> dừng · <kbd>.</kbd> bước · <kbd>R</kbd> làm lại<br>
+    <kbd>T</kbd> vệt · <kbd>C</kbd> màu · <kbd>E</kbd> biên · <kbd>P</kbd>/<kbd>Shift+P</kbd> ± diều hâu<br>
+    <kbd>O</kbd> xoá vật cản · <kbd>S</kbd> chụp · <kbd>F</kbd> toàn màn hình · <kbd>H</kbd> ẩn bảng
+  </div>`;
+panel.innerHTML = html;
+if (innerWidth < 600) panel.classList.add('hidden');
+
+const $ = id => document.getElementById(id);
+function refreshUI() {
+  for (const [, items] of GROUPS) for (const [k] of items) { $('i-' + k).value = P[k]; $('o-' + k).value = fmt(P[k]); }
+  $('i-wrap').checked = P.wrap; $('i-respawn').checked = P.respawn; $('i-colorMode').value = P.colorMode;
+  for (const b of document.querySelectorAll('[data-tool]')) b.classList.toggle('on', b.dataset.tool === S.pointer.mode);
+  $('b-pause').textContent = paused ? 'Tiếp tục' : 'Tạm dừng';
+  $('b-pause').classList.toggle('on', paused);
+}
+function set(k, v) { P[k] = v; Sim.sync(); save(); refreshUI(); }
+
+panel.addEventListener('input', e => {
+  const k = e.target.id.slice(2);
+  if (!(k in P)) return;
+  set(k, e.target.type === 'checkbox' ? e.target.checked : +e.target.value);
+});
+panel.addEventListener('click', e => {
+  const t = e.target.closest('button');
+  if (!t) return;
+  if (t.dataset.tool) { S.pointer.mode = t.dataset.tool; refreshUI(); }
+  ({
+    'b-pause': () => { paused = !paused; refreshUI(); },
+    'b-step': () => { stepOnce = true; },
+    'b-reset': () => Sim.reset(),
+    'b-walls': () => { S.walls = []; },
+    'b-defaults': () => { Object.assign(P, S.DEFAULTS); Sim.sync(); save(); refreshUI(); },
+    'b-shot': shot,
+    'b-full': () => (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.()),
+  })[t.id]?.();
+});
+$('toggle').onclick = () => panel.classList.toggle('hidden');
+
+function shot() {
+  c.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = `flock-${Date.now()}.png`; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+}
+
+// ---------- keyboard ----------
+let paused = false, stepOnce = false;
+addEventListener('keydown', e => {
+  if (e.target.matches('input, select') || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  const act = {
+    ' ': () => { paused = !paused; },
+    '.': () => { stepOnce = true; },
+    r: () => Sim.reset(),
+    t: () => set('trails', P.trails > 0 ? 0 : S.DEFAULTS.trails),
+    c: () => set('colorMode', (P.colorMode + 1) % COLOR_MODES.length),
+    e: () => set('wrap', !P.wrap),
+    p: () => set('predators', Math.max(0, Math.min(10, P.predators + (e.shiftKey ? -1 : 1)))),
+    o: () => { S.walls = []; },
+    s: shot,
+    f: () => $('b-full').click(),
+    h: () => panel.classList.toggle('hidden'),
+  }[k] ?? (k >= '1' && k <= '5' ? () => { S.pointer.mode = TOOLS[k - 1][0]; } : null);
+  if (!act) return;
+  e.preventDefault(); act(); refreshUI();
+});
+
+// ---------- pointer (mouse + touch + pen) ----------
+let pressed = false;
+function applyTool() {
+  const { x, y, mode } = S.pointer;
+  if (mode === 'add') {
+    for (let i = 0; i < 6; i++) Sim.add(x + (Math.random() - 0.5) * 20, y + (Math.random() - 0.5) * 20);
+    P.count = S.n; $('i-count').value = $('o-count').value = S.n;
+  } else if (mode === 'wall') Sim.addWall(x, y);
+  else if (mode === 'erase') Sim.erase(x, y, 20);
+}
+c.addEventListener('pointerdown', e => { pressed = true; c.setPointerCapture(e.pointerId); onMove(e); applyTool(); });
+c.addEventListener('pointermove', onMove);
+c.addEventListener('pointerup', e => { pressed = false; if (e.pointerType !== 'mouse') S.pointer.active = false; save(); });
+c.addEventListener('pointercancel', () => { pressed = false; S.pointer.active = false; });
+c.addEventListener('pointerleave', () => { if (!pressed) S.pointer.active = false; });
+function onMove(e) {
+  S.pointer.x = e.clientX; S.pointer.y = e.clientY;
+  S.pointer.active = e.pointerType === 'mouse' || pressed;
+  if (pressed && e.type === 'pointermove') applyTool();
+}
+
+// ---------- rendering ----------
+const SPECIES_HUE = [200, 28, 135, 285];
+const PALETTES = [
+  Array.from({ length: 4 }, (_, k) => `hsl(${SPECIES_HUE[k]}, 75%, 64%)`),
+  Array.from({ length: 24 }, (_, k) => `hsl(${k * 15}, 72%, 63%)`),
+  Array.from({ length: 12 }, (_, k) => `hsl(${220 - k * 15}, ${55 + k * 3}%, ${42 + k * 2.5}%)`),
+];
+const TAU = Math.PI * 2;
+
+function draw() {
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.globalAlpha = 1 - P.trails;
+  g.fillStyle = BG; g.fillRect(0, 0, S.W, S.H);
+  g.globalAlpha = 1;
+
+  if (S.walls.length) {
+    const wp = new Path2D();
+    for (const o of S.walls) { wp.moveTo(o.x + o.r, o.y); wp.arc(o.x, o.y, o.r, 0, TAU); }
+    g.fillStyle = getVar('--wall'); g.fill(wp);
+    g.strokeStyle = getVar('--wall-edge'); g.lineWidth = 1; g.stroke(wp);
+  }
+
+  // One Path2D per colour bucket -> a handful of fill() calls for thousands of boids.
+  const { n, X, Y, VX, VY, SP, DEN } = S, mode = P.colorMode, pal = PALETTES[mode], nb = mode === 0 ? P.species : pal.length;
+  const paths = Array.from({ length: nb }, () => new Path2D()), z = P.size;
+  for (let i = 0; i < n; i++) {
+    const x = X[i], y = Y[i], vx = VX[i], vy = VY[i], s = Math.hypot(vx, vy) || 1, cs = (vx / s) * z, sn = (vy / s) * z;
+    const key = mode === 0 ? SP[i] % nb
+      : mode === 1 ? ((Math.atan2(vy, vx) / TAU + 1) * nb | 0) % nb
+      : Math.min(nb - 1, Math.sqrt(DEN[i]) * 1.8 | 0);
+    const p = paths[key];
+    p.moveTo(x + 7 * cs, y + 7 * sn);
+    p.lineTo(x - 4 * cs - 3.5 * sn, y - 4 * sn + 3.5 * cs);
+    p.lineTo(x - 4 * cs + 3.5 * sn, y - 4 * sn - 3.5 * cs);
+    p.closePath();
+  }
+  for (let k = 0; k < nb; k++) { g.fillStyle = pal[k]; g.fill(paths[k]); }
+
+  for (const p of S.preds) {
+    const s = Math.hypot(p.vx, p.vy) || 1, cs = (p.vx / s) * z * 2.2, sn = (p.vy / s) * z * 2.2;
+    g.fillStyle = p.cool > 0 ? '#a33b3b' : getVar('--danger');
+    g.beginPath();
+    g.moveTo(p.x + 7 * cs, p.y + 7 * sn);
+    g.lineTo(p.x - 4 * cs - 4.5 * sn, p.y - 4 * sn + 4.5 * cs);
+    g.lineTo(p.x - 2 * cs, p.y - 2 * sn);
+    g.lineTo(p.x - 4 * cs + 4.5 * sn, p.y - 4 * sn - 4.5 * cs);
+    g.fill();
+  }
+
+  const ptr = S.pointer;
+  if (ptr.active) {
+    const r = { hawk: P.fear, lure: 300, add: 10, wall: P.wallSize, erase: 20 }[ptr.mode];
+    g.strokeStyle = { hawk: 'rgba(255,90,90,.35)', lure: 'rgba(120,230,150,.35)' }[ptr.mode] ?? 'rgba(200,215,240,.45)';
+    g.setLineDash(ptr.mode === 'erase' ? [4, 4] : []);
+    g.beginPath(); g.arc(ptr.x, ptr.y, r, 0, TAU); g.stroke();
+    g.setLineDash([]);
+  }
+}
+const varCache = {};
+const getVar = k => (varCache[k] ??= getComputedStyle(document.documentElement).getPropertyValue(k).trim());
+
+// ---------- main loop ----------
+let last = performance.now(), frames = 0, fpsT = last, fps = 0, simMs = 0;
+function frame(t) {
+  const raw = Math.min((t - last) / 16.667, 3); last = t;
+  if (!paused || stepOnce) {
+    // Sub-step so large dt (slow frames, high timeScale) stays stable.
+    const total = paused ? 1 : raw * P.timeScale, steps = Math.max(1, Math.ceil(total / 1.5));
+    const t0 = performance.now();
+    for (let k = 0; k < steps; k++) Sim.step(total / steps);
+    simMs = simMs * 0.9 + (performance.now() - t0) * 0.1;
+    stepOnce = false;
+  }
+  draw();
+  frames++;
+  if (t - fpsT > 500) {
+    fps = (frames * 1000) / (t - fpsT); frames = 0; fpsT = t;
+    hud.textContent = `${fps.toFixed(0)} fps · sim ${simMs.toFixed(1)} ms\n${S.n} chim · ${S.preds.length} diều hâu · đã ăn ${S.eaten}${paused ? '\n⏸ tạm dừng' : ''}`;
+  }
+  requestAnimationFrame(frame);
+}
+refreshUI();
+requestAnimationFrame(frame);
+</script>
+</html>
